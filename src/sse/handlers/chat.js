@@ -21,6 +21,7 @@ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+import { shouldPreserveKiroDirectToolSessionAccount } from "./chat/kiroDirectFallbackPolicy.js";
 
 /**
  * Handle chat completion request
@@ -245,6 +246,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     });
 
     if (result.success) return result.response;
+
+    if (shouldPreserveKiroDirectToolSessionAccount({ provider, body, status: result.status, error: result.error })) {
+      log.warn("AUTH", `Preserving sticky Kiro account for tool session after ${result.status}; skipping cross-account fallback`);
+      return result.response;
+    }
 
     // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs);
