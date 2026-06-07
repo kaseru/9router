@@ -247,13 +247,22 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     if (result.success) return result.response;
 
-    if (shouldPreserveKiroDirectToolSessionAccount({ provider, body, status: result.status, error: result.error })) {
-      log.warn("AUTH", `Preserving sticky Kiro account for tool session after ${result.status}; skipping cross-account fallback`);
-      return result.response;
-    }
+    const preserveStickyKiroToolSession = shouldPreserveKiroDirectToolSessionAccount({
+      provider,
+      body,
+      status: result.status,
+      error: result.error,
+      stickyAccountId: stickyAccountKey ? getStickyAccount(stickyAccountKey) : null,
+      connectionId: credentials.connectionId
+    });
 
     // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs);
+
+    if (preserveStickyKiroToolSession) {
+      log.warn("AUTH", `Preserving sticky Kiro account for tool session after ${result.status}; skipping cross-account fallback`);
+      return result.response;
+    }
 
     if (shouldFallback) {
       log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);

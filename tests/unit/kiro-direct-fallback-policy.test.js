@@ -20,28 +20,33 @@ describe("shouldPreserveKiroDirectToolSessionAccount", () => {
     })).toBe(false);
   });
 
-  it("preserves account for kiro tool sessions on auth failures", () => {
-    expect(shouldPreserveKiroDirectToolSessionAccount({
+  it("preserves account only for pinned sticky kiro tool sessions on auth failures", () => {
+    const base = {
       provider: "kiro",
       body: { tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }] },
-      status: 401,
-      error: "unauthorized"
-    })).toBe(true);
-    expect(shouldPreserveKiroDirectToolSessionAccount({
-      provider: "kiro",
-      body: { tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }] },
-      status: 403,
-      error: "forbidden"
-    })).toBe(true);
+      error: "unauthorized",
+      stickyAccountId: "conn-1",
+      connectionId: "conn-1"
+    };
+
+    expect(shouldPreserveKiroDirectToolSessionAccount({ ...base, status: 401 })).toBe(true);
+    expect(shouldPreserveKiroDirectToolSessionAccount({ ...base, status: 403, error: "forbidden" })).toBe(true);
+    expect(shouldPreserveKiroDirectToolSessionAccount({ ...base, stickyAccountId: null, status: 401 })).toBe(false);
+    expect(shouldPreserveKiroDirectToolSessionAccount({ ...base, stickyAccountId: "conn-2", status: 401 })).toBe(false);
   });
 
-  it("preserves account for kiro tool sessions on quota exhaustion", () => {
-    expect(shouldPreserveKiroDirectToolSessionAccount({
+  it("preserves account only for pinned sticky kiro tool sessions on quota exhaustion", () => {
+    const base = {
       provider: "kiro",
       body: { tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }] },
       status: 429,
-      error: "usage quota exceeded"
-    })).toBe(true);
+      error: "usage quota exceeded",
+      stickyAccountId: "conn-1",
+      connectionId: "conn-1"
+    };
+
+    expect(shouldPreserveKiroDirectToolSessionAccount(base)).toBe(true);
+    expect(shouldPreserveKiroDirectToolSessionAccount({ ...base, stickyAccountId: null })).toBe(false);
   });
 
   it("allows fallback for kiro tool sessions on transient rate limit and server errors", () => {
