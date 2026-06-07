@@ -246,6 +246,45 @@ describe("Kiro agent history hardening", () => {
     expect(JSON.stringify(result.conversationState.history)).toContain("Earlier conversation history was truncated");
   });
 
+
+  it("flattens partial current tool results instead of sending orphaned Kiro toolResults", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "run parallel tools" },
+        { role: "assistant", content: "", tool_calls: [
+          { id: "call_a", type: "function", function: { name: "tool_a", arguments: "{}" } },
+          { id: "call_b", type: "function", function: { name: "tool_b", arguments: "{}" } }
+        ] },
+        { role: "tool", tool_call_id: "call_a", content: "A_OUTPUT" }
+      ],
+      tools: [{ type: "function", function: { name: "tool_a", description: "a", parameters: { type: "object" } } }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const current = result.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext?.toolResults).toBeUndefined();
+    expect(current.content).toContain("Tool results:");
+    expect(current.content).toContain("A_OUTPUT");
+    expect(JSON.stringify(result.conversationState.history)).not.toContain('"toolUses"');
+  });
+
+  it("flattens current tool results if truncation removes their matching tool_use history", () => {
+    const huge = "x".repeat(960 * 1024);
+    const body = {
+      messages: [
+        { role: "user", content: huge },
+        { role: "assistant", content: "", tool_calls: [{ id: "call_active", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_active", content: "ACTIVE_OUTPUT" }
+      ],
+      tools: [{ type: "function", function: { name: "read_file", description: "read", parameters: { type: "object" } } }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const current = result.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext?.toolResults).toBeUndefined();
+    expect(current.content).toContain("ACTIVE_OUTPUT");
+  });
+
   it("preserves exact tool names so client tool registry still matches", () => {
     const longName = "mcp__filesystem__read_file_with_a_very_long_registered_tool_name_that_must_not_change";
     const body = {

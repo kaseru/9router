@@ -64,6 +64,16 @@ function collectCurrentToolResultIds(currentMessage) {
   return ids.size ? ids : null;
 }
 
+function collectHistoryToolUseIds(history) {
+  const ids = new Set();
+  for (const item of history || []) {
+    for (const toolUse of item.assistantResponseMessage?.toolUses || []) {
+      if (toolUse.toolUseId) ids.add(toolUse.toolUseId);
+    }
+  }
+  return ids;
+}
+
 function narrateToolResults(toolResults, toolNames) {
   const parts = [];
   for (const result of toolResults || []) {
@@ -78,6 +88,23 @@ function joinText(a, b) {
   a = String(a || "").trim();
   b = String(b || "").trim();
   return a && b ? `${a}\n\n${b}` : (a || b);
+}
+
+function flattenCurrentToolResults(currentMessage) {
+  const msg = currentMessage?.userInputMessage;
+  const ctx = msg?.userInputMessageContext;
+  if (!ctx?.toolResults?.length) return;
+  msg.content = joinText(msg.content, narrateToolResults(ctx.toolResults, new Map()));
+  delete ctx.toolResults;
+  if (Object.keys(ctx).length === 0) delete msg.userInputMessageContext;
+}
+
+function ensureCurrentToolResultsPaired(history, currentMessage) {
+  const results = currentMessage?.userInputMessage?.userInputMessageContext?.toolResults || [];
+  if (!results.length) return;
+  const toolUseIds = collectHistoryToolUseIds(history);
+  const hasOrphanedResult = results.some(result => !result.toolUseId || !toolUseIds.has(result.toolUseId));
+  if (hasOrphanedResult) flattenCurrentToolResults(currentMessage);
 }
 
 function sanitizeKiroHistory(history, currentToolResultIds) {
@@ -110,7 +137,7 @@ function sanitizeKiroHistory(history, currentToolResultIds) {
         assistant.content = assistant.content.replace(POLLUTED_TOOL_CALL_TEXT, "").replace(/\n{3,}/g, "\n\n").trim();
       }
       if (i !== activeAssistantIndex && Array.isArray(assistant.toolUses)) {
-        assistant.toolUses = [];
+        delete assistant.toolUses;
       }
       if (!assistant.content?.trim() && (!assistant.toolUses || assistant.toolUses.length === 0)) {
         continue;
@@ -463,6 +490,7 @@ function convertMessages(messages, tools, model) {
   });
 
   history = sanitizeKiroHistory(history, collectCurrentToolResultIds(currentMessage));
+  ensureCurrentToolResultsPaired(history, currentMessage);
 
   // Merge consecutive user messages (Kiro requires alternating user/assistant)
   const mergedHistory = [];
@@ -570,6 +598,10 @@ export function buildKiroPayload(model, body, stream, credentials) {
   }
 
   truncateKiroPayload(payload);
+  ensureCurrentToolResultsPaired(
+    payload.conversationState.history,
+    payload.conversationState.currentMessage
+  );
 
   // Tag payload so the executor can route the upstream model id correctly.
   Object.defineProperty(payload, "_kiroUpstreamModel", {

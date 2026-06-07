@@ -60,4 +60,26 @@ describe("KiroExecutor event stream translation", () => {
     expect(json.at(-1).choices[0].finish_reason).toBe("tool_calls");
     expect(chunks.at(-1)).toBe("[DONE]");
   });
+
+  it("starts a new id-less tool call when the tool name changes without a done flag", async () => {
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(frame("toolUseEvent", { toolUseId: "tool_1", name: "read_file", input: "{}" }));
+        controller.enqueue(frame("toolUseEvent", { name: "write_file", input: "{\"path\":\"/tmp/b\"}", done: true }));
+        controller.enqueue(frame("messageStopEvent", {}));
+        controller.close();
+      }
+    });
+    const executor = new KiroExecutor();
+    const response = executor.transformEventStreamToSSE(new Response(body, { status: 200 }), "kiro-test");
+    const chunks = await readSse(response);
+    const json = chunks.filter(c => c !== "[DONE]").map(JSON.parse);
+    const started = json.flatMap(c => c.choices[0].delta.tool_calls || []).filter(c => c.id);
+
+    expect(started).toHaveLength(2);
+    expect(started[0].id).toBe("tool_1");
+    expect(started[0].function.name).toBe("read_file");
+    expect(started[1].id).not.toBe("tool_1");
+    expect(started[1].function.name).toBe("write_file");
+  });
 });
