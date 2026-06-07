@@ -173,3 +173,142 @@ describe("buildKiroPayload", () => {
     });
   });
 });
+
+describe("Kiro agent history hardening", () => {
+  it("flattens old tool results into user history and keeps only current active tool result structured", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "start" },
+        { role: "assistant", content: "", tool_calls: [{ id: "old_1", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "old_1", content: "OLD_OUTPUT" },
+        { role: "user", content: "continue" },
+        { role: "assistant", content: "", tool_calls: [{ id: "active_1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "active_1", content: "ACTIVE_OUTPUT" },
+      ],
+      tools: [{ type: "function", function: { name: "exec_command", description: "exec", parameters: { type: "object" } } }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const history = result.conversationState.history;
+    const oldText = JSON.stringify(history);
+    expect(oldText).toContain("Tool results:");
+    expect(oldText).toContain("OLD_OUTPUT");
+    expect(oldText).not.toContain("[Called tool");
+
+    const currentCtx = result.conversationState.currentMessage.userInputMessage.userInputMessageContext;
+    expect(currentCtx.toolResults).toHaveLength(1);
+    expect(currentCtx.toolResults[0].toolUseId).toBe("active_1");
+  });
+
+  it("removes replayed assistant tool-call narration from history", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "start" },
+        { role: "assistant", content: "Let me check.\n\n[Called tool exec_command with input {\"cmd\":\"pwd\"}]" },
+        { role: "user", content: "continue" },
+      ]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const serialized = JSON.stringify(result.conversationState.history);
+    expect(serialized).toContain("Let me check.");
+    expect(serialized).not.toContain("[Called tool");
+  });
+
+  it("cleans tool schema fields Kiro rejects", () => {
+    const body = {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: {
+        name: "tool_with_schema",
+        description: "",
+        parameters: { type: "object", properties: { x: { type: "string" } }, required: [], additionalProperties: false }
+      }}]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const schema = result.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.inputSchema.json;
+    expect(schema.additionalProperties).toBeUndefined();
+    expect(schema.required).toBeUndefined();
+    expect(schema.type).toBe("object");
+  });
+
+  it("truncates oversized Kiro payloads before sending upstream", () => {
+    const huge = "x".repeat(12000);
+    const messages = [{ role: "user", content: "start" }];
+    for (let i = 0; i < 120; i++) {
+      messages.push({ role: "assistant", content: `assistant ${i}` });
+      messages.push({ role: "user", content: `${huge}-${i}` });
+    }
+    messages.push({ role: "user", content: "final" });
+
+    const result = buildKiroPayload("claude-sonnet-4.6", { messages }, true, {});
+    expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThanOrEqual(900 * 1024);
+    expect(JSON.stringify(result.conversationState.history)).toContain("Earlier conversation history was truncated");
+  });
+
+
+  it("flattens partial current tool results instead of sending orphaned Kiro toolResults", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "run parallel tools" },
+        { role: "assistant", content: "", tool_calls: [
+          { id: "call_a", type: "function", function: { name: "tool_a", arguments: "{}" } },
+          { id: "call_b", type: "function", function: { name: "tool_b", arguments: "{}" } }
+        ] },
+        { role: "tool", tool_call_id: "call_a", content: "A_OUTPUT" }
+      ],
+      tools: [{ type: "function", function: { name: "tool_a", description: "a", parameters: { type: "object" } } }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const current = result.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext?.toolResults).toBeUndefined();
+    expect(current.content).toContain("Tool results:");
+    expect(current.content).toContain("A_OUTPUT");
+    expect(JSON.stringify(result.conversationState.history)).not.toContain('"toolUses"');
+  });
+
+  it("flattens current tool results if truncation removes their matching tool_use history", () => {
+    const huge = "x".repeat(960 * 1024);
+    const body = {
+      messages: [
+        { role: "user", content: huge },
+        { role: "assistant", content: "", tool_calls: [{ id: "call_active", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_active", content: "ACTIVE_OUTPUT" }
+      ],
+      tools: [{ type: "function", function: { name: "read_file", description: "read", parameters: { type: "object" } } }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const current = result.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext?.toolResults).toBeUndefined();
+    expect(current.content).toContain("ACTIVE_OUTPUT");
+  });
+
+  it("preserves exact tool names so client tool registry still matches", () => {
+    const longName = "mcp__filesystem__read_file_with_a_very_long_registered_tool_name_that_must_not_change";
+    const body = {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: longName, description: "read", parameters: { type: "object" } } }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const spec = result.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification;
+    expect(spec.name).toBe(longName);
+  });
+
+  it("truncates current message middle while preserving prefix and latest user tail", () => {
+    const head = "IMPORTANT_PREFIX_KEEP";
+    const tail = "IMPORTANT_LATEST_TAIL_KEEP";
+    const body = {
+      messages: [{ role: "user", content: `${head}\n${"x".repeat(1100 * 1024)}\n${tail}` }]
+    };
+
+    const result = buildKiroPayload("claude-sonnet-4.6", body, true, {});
+    const content = result.conversationState.currentMessage.userInputMessage.content;
+    expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThanOrEqual(900 * 1024);
+    expect(content).toContain(head);
+    expect(content).toContain(tail);
+    expect(content).toContain("Middle of current message truncated");
+  });
+});

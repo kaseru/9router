@@ -12,6 +12,255 @@ import {
   KIRO_AGENTIC_SYSTEM_PROMPT
 } from "../../config/kiroConstants.js";
 
+
+const MAX_KIRO_PAYLOAD_BYTES = 900 * 1024;
+const MIN_RECENT_HISTORY_TURNS = 4;
+const TOOL_RESULTS_PREFIX = "Tool results:";
+const TRUNCATION_PLACEHOLDER = "[Earlier conversation history was truncated to fit Kiro's request limit. Older messages and tool activity were omitted.]";
+const CURRENT_MESSAGE_TRUNCATION_MARKER = "\n\n[Middle of current message truncated to fit Kiro's request limit.]\n\n";
+const POLLUTED_TOOL_CALL_TEXT = /\[Called tool [^\]]*\]/g;
+
+function warnKiroRuntime(message, meta = {}) {
+  const details = Object.entries(meta)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  console.warn(`[KiroTranslator] ${message}${details ? ` ${details}` : ""}`);
+}
+
+function sanitizeToolName(name) {
+  // Preserve exact tool names so returned OpenAI tool_calls still match the
+  // client's registered tool registry. Schema cleanup is safe; renaming tools
+  // is not unless we also map Kiro's output name back to the original name.
+  const raw = String(name || "tool").trim();
+  return raw || "tool";
+}
+
+function normalizeToolSchema(schema) {
+  const root = schema && typeof schema === "object" && !Array.isArray(schema)
+    ? structuredCloneSafe(schema)
+    : { type: "object", properties: {} };
+  cleanToolSchema(root);
+  if (!root.type) root.type = "object";
+  if (root.type === "object" && !root.properties) root.properties = {};
+  return root;
+}
+
+function cleanToolSchema(node) {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    node.forEach(cleanToolSchema);
+    return;
+  }
+  delete node.additionalProperties;
+  if ("required" in node && (!Array.isArray(node.required) || node.required.length === 0)) {
+    delete node.required;
+  }
+  for (const value of Object.values(node)) cleanToolSchema(value);
+}
+
+function structuredCloneSafe(value) {
+  try {
+    if (typeof structuredClone === "function") return structuredClone(value);
+  } catch {}
+  try { return JSON.parse(JSON.stringify(value)); } catch { return { type: "object", properties: {} }; }
+}
+
+function collectCurrentToolResultIds(currentMessage) {
+  const results = currentMessage?.userInputMessage?.userInputMessageContext?.toolResults || [];
+  const ids = new Set(results.map(r => r.toolUseId).filter(Boolean));
+  return ids.size ? ids : null;
+}
+
+function collectHistoryToolUseIds(history) {
+  const ids = new Set();
+  for (const item of history || []) {
+    for (const toolUse of item.assistantResponseMessage?.toolUses || []) {
+      if (toolUse.toolUseId) ids.add(toolUse.toolUseId);
+    }
+  }
+  return ids;
+}
+
+function narrateToolResults(toolResults, toolNames) {
+  const parts = [];
+  for (const result of toolResults || []) {
+    const text = (result.content || []).map(c => c.text || "").filter(Boolean).join("\n") || "(no output)";
+    const name = toolNames.get(result.toolUseId);
+    parts.push(name ? `[${name}] ${text}` : text);
+  }
+  return parts.length ? `${TOOL_RESULTS_PREFIX}\n\n${parts.join("\n\n")}` : "";
+}
+
+function joinText(a, b) {
+  a = String(a || "").trim();
+  b = String(b || "").trim();
+  return a && b ? `${a}\n\n${b}` : (a || b);
+}
+
+function flattenCurrentToolResults(currentMessage, reason = "unpaired") {
+  const msg = currentMessage?.userInputMessage;
+  const ctx = msg?.userInputMessageContext;
+  if (!ctx?.toolResults?.length) return;
+  warnKiroRuntime("flattening current toolResults to avoid orphaned Kiro tool_result", {
+    reason,
+    count: ctx.toolResults.length
+  });
+  msg.content = joinText(msg.content, narrateToolResults(ctx.toolResults, new Map()));
+  delete ctx.toolResults;
+  if (Object.keys(ctx).length === 0) delete msg.userInputMessageContext;
+}
+
+function ensureCurrentToolResultsPaired(history, currentMessage) {
+  const results = currentMessage?.userInputMessage?.userInputMessageContext?.toolResults || [];
+  if (!results.length) return;
+  const toolUseIds = collectHistoryToolUseIds(history);
+  const hasOrphanedResult = results.some(result => !result.toolUseId || !toolUseIds.has(result.toolUseId));
+  if (hasOrphanedResult) flattenCurrentToolResults(currentMessage, "missing_matching_tool_use");
+}
+
+function sanitizeKiroHistory(history, currentToolResultIds) {
+  if (!Array.isArray(history) || history.length === 0) return history || [];
+
+  const toolNames = new Map();
+  for (const item of history) {
+    for (const toolUse of item.assistantResponseMessage?.toolUses || []) {
+      if (toolUse.toolUseId && toolUse.name) toolNames.set(toolUse.toolUseId, toolUse.name);
+    }
+  }
+
+  let activeAssistantIndex = -1;
+  if (currentToolResultIds?.size) {
+    const last = history[history.length - 1];
+    const uses = last?.assistantResponseMessage?.toolUses || [];
+    if (uses.length && uses.every(u => currentToolResultIds.has(u.toolUseId))) {
+      activeAssistantIndex = history.length - 1;
+    }
+  }
+
+  const cleaned = [];
+  for (let i = 0; i < history.length; i++) {
+    const item = history[i];
+    const assistant = item.assistantResponseMessage;
+    const user = item.userInputMessage;
+
+    if (assistant) {
+      if (assistant.content) {
+        assistant.content = assistant.content.replace(POLLUTED_TOOL_CALL_TEXT, "").replace(/\n{3,}/g, "\n\n").trim();
+      }
+      if (i !== activeAssistantIndex && Array.isArray(assistant.toolUses)) {
+        delete assistant.toolUses;
+      }
+      if (!assistant.content?.trim() && (!assistant.toolUses || assistant.toolUses.length === 0)) {
+        continue;
+      }
+    }
+
+    if (user?.userInputMessageContext) {
+      const ctx = user.userInputMessageContext;
+      if (ctx.toolResults?.length) {
+        user.content = joinText(user.content, narrateToolResults(ctx.toolResults, toolNames));
+        delete ctx.toolResults;
+      }
+      delete ctx.tools;
+      if (Object.keys(ctx).length === 0) delete user.userInputMessageContext;
+    }
+
+    if (user && !String(user.content || "").trim() && !user.images?.length) user.content = "continue";
+
+    const prev = cleaned[cleaned.length - 1];
+    if (user && prev?.userInputMessage && !user.images?.length &&
+        String(prev.userInputMessage.content || "").trim() === String(user.content || "").trim()) {
+      continue;
+    }
+    cleaned.push(item);
+  }
+
+  while (cleaned[0]?.assistantResponseMessage) cleaned.shift();
+  return cleaned;
+}
+
+function payloadSize(payload) {
+  try { return new TextEncoder().encode(JSON.stringify(payload)).length; } catch { return 0; }
+}
+
+function truncateKiroPayload(payload) {
+  if (!payload?.conversationState) return;
+  let size = payloadSize(payload);
+  if (size <= MAX_KIRO_PAYLOAD_BYTES) return;
+  warnKiroRuntime("truncating oversized Kiro payload", {
+    size,
+    limit: MAX_KIRO_PAYLOAD_BYTES,
+    history: payload.conversationState.history?.length || 0
+  });
+
+  const history = payload.conversationState.history || [];
+  if (!history.length) return truncateCurrentMessage(payload, size);
+
+  // Drop old history in one coarse pass based on total excess, then do a tiny
+  // confirmation loop. This avoids repeatedly stringifying ~1MB payloads once
+  // per history item in the common oversized-history case.
+  const historyBytes = history.map(item => payloadSize(item));
+  let keepFrom = Math.max(0, history.length - MIN_RECENT_HISTORY_TURNS);
+  let bytesToDrop = size - MAX_KIRO_PAYLOAD_BYTES;
+  for (let i = 0; i < keepFrom && bytesToDrop > 0; i++) {
+    bytesToDrop -= historyBytes[i];
+    keepFrom = i + 1;
+  }
+
+  while (keepFrom < history.length && history[keepFrom]?.assistantResponseMessage) {
+    keepFrom++;
+  }
+
+  let rebuilt = [placeholderHistory(), ...history.slice(keepFrom)];
+  payload.conversationState.history = rebuilt;
+  size = payloadSize(payload);
+
+  while (size > MAX_KIRO_PAYLOAD_BYTES && payload.conversationState.history.length > 1) {
+    payload.conversationState.history.splice(1, 1);
+    while (payload.conversationState.history[1]?.assistantResponseMessage) {
+      payload.conversationState.history.splice(1, 1);
+    }
+    size = payloadSize(payload);
+  }
+
+  if (size > MAX_KIRO_PAYLOAD_BYTES) truncateCurrentMessage(payload, size);
+}
+
+function placeholderHistory() {
+  return {
+    userInputMessage: {
+      content: TRUNCATION_PLACEHOLDER,
+      modelId: "",
+      origin: "AI_EDITOR"
+    }
+  };
+}
+
+function truncateCurrentMessage(payload, knownSize = payloadSize(payload)) {
+  const msg = payload.conversationState.currentMessage?.userInputMessage;
+  if (!msg?.content || knownSize <= MAX_KIRO_PAYLOAD_BYTES) return;
+
+  warnKiroRuntime("truncating Kiro current message middle", {
+    size: knownSize,
+    limit: MAX_KIRO_PAYLOAD_BYTES,
+    chars: msg.content.length
+  });
+
+  while (knownSize > MAX_KIRO_PAYLOAD_BYTES && msg.content.length > CURRENT_MESSAGE_TRUNCATION_MARKER.length + 64) {
+    const excess = knownSize - MAX_KIRO_PAYLOAD_BYTES;
+    const removeChars = Math.min(
+      msg.content.length - CURRENT_MESSAGE_TRUNCATION_MARKER.length - 64,
+      Math.max(Math.ceil(excess / 2) + 2048, Math.floor(msg.content.length * 0.25))
+    );
+    const keepChars = msg.content.length - removeChars - CURRENT_MESSAGE_TRUNCATION_MARKER.length;
+    const keepStart = Math.max(32, Math.floor(keepChars * 0.35));
+    const keepEnd = Math.max(32, keepChars - keepStart);
+    msg.content = `${msg.content.slice(0, keepStart)}${CURRENT_MESSAGE_TRUNCATION_MARKER}${msg.content.slice(-keepEnd)}`;
+    knownSize = payloadSize(payload);
+  }
+}
+
 /**
  * Convert OpenAI messages to Kiro format
  * Rules: system/tool/user -> user role, merge consecutive same roles
@@ -64,16 +313,13 @@ function convertMessages(messages, tools, model) {
           }
           
           const schema = t.function?.parameters || t.parameters || t.input_schema || {};
-          // Normalize schema: Kiro requires required[] and proper type/properties
-          const normalizedSchema = Object.keys(schema).length === 0
-            ? { type: "object", properties: {}, required: [] }
-            : { ...schema, required: schema.required ?? [] };
+          const cleanedName = sanitizeToolName(name);
 
           return {
             toolSpecification: {
-              name,
+              name: cleanedName,
               description,
-              inputSchema: { json: normalizedSchema }
+              inputSchema: { json: normalizeToolSchema(schema) }
             }
           };
         });
@@ -266,6 +512,9 @@ function convertMessages(messages, tools, model) {
     }
   });
 
+  history = sanitizeKiroHistory(history, collectCurrentToolResultIds(currentMessage));
+  ensureCurrentToolResultsPaired(history, currentMessage);
+
   // Merge consecutive user messages (Kiro requires alternating user/assistant)
   const mergedHistory = [];
   for (let i = 0; i < history.length; i++) {
@@ -370,6 +619,12 @@ export function buildKiroPayload(model, body, stream, credentials) {
     if (temperature !== undefined) payload.inferenceConfig.temperature = temperature;
     if (topP !== undefined) payload.inferenceConfig.topP = topP;
   }
+
+  truncateKiroPayload(payload);
+  ensureCurrentToolResultsPaired(
+    payload.conversationState.history,
+    payload.conversationState.currentMessage
+  );
 
   // Tag payload so the executor can route the upstream model id correctly.
   Object.defineProperty(payload, "_kiroUpstreamModel", {

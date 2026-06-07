@@ -197,16 +197,29 @@ export class KiroExecutor extends BaseExecutor {
             controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
           }
 
-          // Handle toolUseEvent
+          // Handle toolUseEvent. Kiro can stream tool calls as several partial
+          // events and some variants use different field names or omit id on
+          // early chunks. Keep a current pending id so argument chunks stay on
+          // the same OpenAI tool_call instead of creating one call per chunk.
           if (eventType === "toolUseEvent" && event.payload) {
             state.hasToolCalls = true;
             const toolUse = event.payload;
             const toolUses = Array.isArray(toolUse) ? toolUse : [toolUse];
 
             for (const singleToolUse of toolUses) {
-              const toolCallId = singleToolUse.toolUseId || `call_${Date.now()}`;
-              const toolName = singleToolUse.name || "";
+              const explicitId = singleToolUse.toolUseId || singleToolUse.toolUseID || singleToolUse.tool_use_id || singleToolUse.id;
+              const toolName = singleToolUse.name || singleToolUse.toolName || singleToolUse.tool_name || "";
+              const startsNamedNextTool = !explicitId && toolName && state.currentToolName && toolName !== state.currentToolName;
+              const ambiguousIdlessChunk = !explicitId && !toolName && state.currentToolCallId;
+              if (ambiguousIdlessChunk && !state.warnedAmbiguousIdlessToolChunk) {
+                state.warnedAmbiguousIdlessToolChunk = true;
+                console.warn("[Kiro] id-less/name-less toolUseEvent chunk; attaching to current tool call because stream cannot disambiguate");
+              }
+              const toolCallId = explicitId || (startsNamedNextTool ? null : state.currentToolCallId) || `call_${Date.now()}`;
               const toolInput = singleToolUse.input;
+              const toolDone = singleToolUse.stop === true || singleToolUse.isStop === true || singleToolUse.done === true;
+              state.currentToolCallId = toolCallId;
+              if (toolName) state.currentToolName = toolName;
 
               let toolIndex;
               const isNewTool = !state.seenToolIds.has(toolCallId);
@@ -274,6 +287,11 @@ export class KiroExecutor extends BaseExecutor {
                 };
                 chunkIndex++;
                 controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(argsChunk)}\n\n`));
+              }
+
+              if (toolDone && state.currentToolCallId === toolCallId) {
+                state.currentToolCallId = null;
+                state.currentToolName = null;
               }
             }
           }
