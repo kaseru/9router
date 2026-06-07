@@ -20,6 +20,14 @@ const TRUNCATION_PLACEHOLDER = "[Earlier conversation history was truncated to f
 const CURRENT_MESSAGE_TRUNCATION_MARKER = "\n\n[Middle of current message truncated to fit Kiro's request limit.]\n\n";
 const POLLUTED_TOOL_CALL_TEXT = /\[Called tool [^\]]*\]/g;
 
+function warnKiroRuntime(message, meta = {}) {
+  const details = Object.entries(meta)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  console.warn(`[KiroTranslator] ${message}${details ? ` ${details}` : ""}`);
+}
+
 function sanitizeToolName(name) {
   // Preserve exact tool names so returned OpenAI tool_calls still match the
   // client's registered tool registry. Schema cleanup is safe; renaming tools
@@ -90,10 +98,14 @@ function joinText(a, b) {
   return a && b ? `${a}\n\n${b}` : (a || b);
 }
 
-function flattenCurrentToolResults(currentMessage) {
+function flattenCurrentToolResults(currentMessage, reason = "unpaired") {
   const msg = currentMessage?.userInputMessage;
   const ctx = msg?.userInputMessageContext;
   if (!ctx?.toolResults?.length) return;
+  warnKiroRuntime("flattening current toolResults to avoid orphaned Kiro tool_result", {
+    reason,
+    count: ctx.toolResults.length
+  });
   msg.content = joinText(msg.content, narrateToolResults(ctx.toolResults, new Map()));
   delete ctx.toolResults;
   if (Object.keys(ctx).length === 0) delete msg.userInputMessageContext;
@@ -104,7 +116,7 @@ function ensureCurrentToolResultsPaired(history, currentMessage) {
   if (!results.length) return;
   const toolUseIds = collectHistoryToolUseIds(history);
   const hasOrphanedResult = results.some(result => !result.toolUseId || !toolUseIds.has(result.toolUseId));
-  if (hasOrphanedResult) flattenCurrentToolResults(currentMessage);
+  if (hasOrphanedResult) flattenCurrentToolResults(currentMessage, "missing_matching_tool_use");
 }
 
 function sanitizeKiroHistory(history, currentToolResultIds) {
@@ -176,6 +188,11 @@ function truncateKiroPayload(payload) {
   if (!payload?.conversationState) return;
   let size = payloadSize(payload);
   if (size <= MAX_KIRO_PAYLOAD_BYTES) return;
+  warnKiroRuntime("truncating oversized Kiro payload", {
+    size,
+    limit: MAX_KIRO_PAYLOAD_BYTES,
+    history: payload.conversationState.history?.length || 0
+  });
 
   const history = payload.conversationState.history || [];
   if (!history.length) return truncateCurrentMessage(payload, size);
@@ -223,6 +240,12 @@ function placeholderHistory() {
 function truncateCurrentMessage(payload, knownSize = payloadSize(payload)) {
   const msg = payload.conversationState.currentMessage?.userInputMessage;
   if (!msg?.content || knownSize <= MAX_KIRO_PAYLOAD_BYTES) return;
+
+  warnKiroRuntime("truncating Kiro current message middle", {
+    size: knownSize,
+    limit: MAX_KIRO_PAYLOAD_BYTES,
+    chars: msg.content.length
+  });
 
   while (knownSize > MAX_KIRO_PAYLOAD_BYTES && msg.content.length > CURRENT_MESSAGE_TRUNCATION_MARKER.length + 64) {
     const excess = knownSize - MAX_KIRO_PAYLOAD_BYTES;
