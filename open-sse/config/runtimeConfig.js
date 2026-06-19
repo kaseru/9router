@@ -31,15 +31,26 @@ export const MEMORY_CONFIG = {
   proxyDispatchersMaxSize: 20,
 };
 
+// Parse a positive integer env override, falling back to a default.
+function envMs(name, def) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return def;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+
 // Stream stall timeout: abort if no chunk received within this duration.
 // Kiro/Claude can pause well over 30s mid-stream while generating a large
 // tool-call argument (e.g. a big file body) before emitting the next chunk;
 // too tight a timeout aborts those legitimate long writes and drops the
-// finish chunk + [DONE], hanging the client. 180s tolerates these pauses.
-export const STREAM_STALL_TIMEOUT_MS = 180 * 1000;
+// finish chunk + [DONE], hanging the client. Env keeps runtime tunable.
+export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 1000);
+
+// Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
+export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
-export const FETCH_CONNECT_TIMEOUT_MS = 20 * 1000;
+export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 
 // Default token limits
 export const DEFAULT_MAX_TOKENS = 64000;
