@@ -312,7 +312,7 @@ export class KiroExecutor extends BaseExecutor {
   shouldRetry(status, urlIndex) {
     const hasFallback = urlIndex + 1 < this.getFallbackCount();
     return super.shouldRetry(status, urlIndex)
-      || (hasFallback && KIRO_ENDPOINT_FALLBACK_STATUSES.has(status));
+      || (!this._kiroIntegrityRetry && hasFallback && KIRO_ENDPOINT_FALLBACK_STATUSES.has(status));
   }
 
   transformRequest(model, body, stream, credentials) {
@@ -430,11 +430,17 @@ export class KiroExecutor extends BaseExecutor {
       ? appendRepairInstruction(args.body, repairKind === "invalid_tool" ? "tool" : repairKind)
       : structuredClone(args.body || {});
 
-    const retry = await BaseExecutor.prototype.execute.call(this, {
-      ...args,
-      body: repairBody,
-      signal: options.signal
-    });
+    let retry;
+    this._kiroIntegrityRetry = true;
+    try {
+      retry = await BaseExecutor.prototype.execute.call(this, {
+        ...args,
+        body: repairBody,
+        signal: options.signal
+      });
+    } finally {
+      this._kiroIntegrityRetry = false;
+    }
     if (!retry?.response?.ok) {
       let body = "";
       try {
@@ -442,10 +448,10 @@ export class KiroExecutor extends BaseExecutor {
           retry?.response,
           options.signal,
           Math.min(options.maxBytes, 4096),
-          options.stallTimeoutMs
+          Math.min(options.stallTimeoutMs, 250)
         );
       } catch (error) {
-        if (error.name === "AbortError") throw error;
+        if (error.name === "AbortError" && options.signal?.aborted) throw error;
       }
       return encodeSSEError(
         "kiro_integrity_retry_upstream_error",
@@ -800,25 +806,34 @@ export class KiroExecutor extends BaseExecutor {
         const values = Array.isArray(event.payload) ? event.payload : [event.payload];
         if (!values[0]) throw new Error("Kiro toolUseEvent is empty");
         for (const value of values) {
-          const name = typeof value?.name === "string" ? value.name.trim() : "";
-          if (!name) throw new Error("Kiro toolUseEvent is missing a tool name");
-          let id;
-          if (value.toolUseId == null) {
-            id = `call_${created}_${state.tools.size + 1}`;
-          } else if (typeof value.toolUseId !== "string" || !value.toolUseId.trim()) {
+          const explicitId = value?.toolUseId ?? value?.toolUseID ?? value?.tool_use_id ?? value?.id;
+          const rawName = typeof value?.name === "string" ? value.name :
+            typeof value?.toolName === "string" ? value.toolName :
+            typeof value?.tool_name === "string" ? value.tool_name : "";
+          const name = rawName.trim();
+          const startsNamedNextTool = !explicitId && name && state.currentToolName && name !== state.currentToolName;
+          const id = explicitId == null || explicitId === ""
+            ? (startsNamedNextTool ? `call_${created}_${state.tools.size + 1}` : state.currentToolCallId || `call_${created}_${state.tools.size + 1}`)
+            : explicitId;
+          if (typeof id !== "string" || !id.trim()) {
             throw new Error("Kiro toolUseEvent has an invalid toolUseId");
-          } else {
-            id = value.toolUseId;
           }
-          let tool = state.tools.get(id);
+          const existing = state.tools.get(id);
+          const finalName = name || existing?.name || state.currentToolName || "";
+          if (!finalName) throw new Error("Kiro toolUseEvent is missing a tool name");
+          let tool = existing;
           if (!tool) {
-            tool = { id, name };
+            tool = { id, name: finalName };
             state.tools.set(id, tool);
-            state.bufferedToolBytes += encoder.encode(id).byteLength + encoder.encode(name).byteLength + 32;
+            state.bufferedToolBytes += encoder.encode(id).byteLength + encoder.encode(finalName).byteLength + 32;
             assertToolBufferBound();
-          } else if (tool.name !== name) {
+          } else {
+            if (name && tool.name !== name) {
             throw new Error("Kiro tool name changed between fragments");
+            }
           }
+          state.currentToolCallId = id;
+          state.currentToolName = finalName;
           appendToolInput(tool, value.input);
         }
       } else if (eventType === "messageStopEvent") {
