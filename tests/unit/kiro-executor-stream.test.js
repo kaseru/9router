@@ -23,10 +23,22 @@ function frame(eventType, payload) {
   const view = new DataView(out.buffer);
   view.setUint32(0, totalLength, false);
   view.setUint32(4, headers.length, false);
-  // prelude CRC placeholder at 8..11 stays zero; parser does not validate CRC.
+  view.setUint32(8, crc32(out.subarray(0, 8)), false);
   out.set(headers, 12);
   out.set(payloadBytes, 12 + headers.length);
+  view.setUint32(totalLength - 4, crc32(out.subarray(0, totalLength - 4)), false);
   return out;
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 async function readSse(response) {
@@ -34,6 +46,7 @@ async function readSse(response) {
   return text
     .split("\n\n")
     .filter(Boolean)
+    .filter(line => line.startsWith("data: "))
     .map(line => line.replace(/^data: /, ""));
 }
 
